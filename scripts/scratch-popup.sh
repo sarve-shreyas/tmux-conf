@@ -19,5 +19,7 @@ NAME="$(tmux display -p '#{session_name}' 2>/dev/null)"
 # exist yet). TMUX= forces tmux to attach across servers without the nesting
 # refusal. Detaching (prefix g, or prefix d) just hides it — the float server
 # keeps the session (and any server you ran in it) alive.
+# A NEW float starts in the current window's dir ($PWD is set by display-popup's
+# -d "#{pane_current_path}"). Reattaching an existing float keeps its own dir.
 TMUX= tmux -L "$SOCK" attach -t "$NAME" 2>/dev/null \
-  || TMUX= tmux -L "$SOCK" -f "$CONF" new -s "$NAME"
+  || TMUX= tmux -L "$SOCK" -f "$CONF" new -s "$NAME" -c "$PWD"
