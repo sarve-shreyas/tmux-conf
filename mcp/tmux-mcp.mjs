@@ -42,7 +42,7 @@ import { access, mkdir, readdir, readFile, realpath, writeFile } from "node:fs/p
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const SERVER_INFO = { name: "tmux", version: "1.7.0" };
+const SERVER_INFO = { name: "tmux", version: "1.7.1" };
 const SUPPORTED_PROTOCOLS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
 const LATEST_PROTOCOL = "2025-06-18";
 const MAX_CHARS = 50_000;
@@ -768,7 +768,7 @@ async function waitFor({ target, pattern, timeout_ms, server }) {
       return `matched /${pattern}/ after ${secs}s (pane ${info.id}):\n${hit}\n--- last 15 lines ---\n${ls.slice(-15).join("\n")}`;
     }
     if (Date.now() - t0 >= timeoutMs) {
-      throw new Error(`pattern /${pattern}/ not seen in pane ${info.id} within ${timeoutMs}ms. Last 15 lines:\n${ls.slice(-15).join("\n")}`);
+      return `TIMEOUT (not an error): pattern /${pattern}/ not seen in pane ${info.id} within ${timeoutMs}ms — reissue this call to keep waiting; it returns immediately if the pattern has landed since. Last 15 lines:\n${ls.slice(-15).join("\n")}`;
     }
     await sleep(500);
   }
@@ -800,7 +800,7 @@ async function waitSilence({ target, quiet_ms, timeout_ms, server }) {
       return `pane ${info.id} went quiet (no output change for ${quietMs}ms, after ${secs}s). Output since this call:\n---\n${tailChars(ls.join("\n") || "(none)")}`;
     }
     if (Date.now() - t0 >= timeoutMs) {
-      throw new Error(`pane ${info.id} still producing output after ${timeoutMs}ms. Last 15 lines:\n${(await capture(sock, info.id, 15)).join("\n")}`);
+      return `TIMEOUT (not an error): pane ${info.id} still producing output after ${timeoutMs}ms — reissue this call to keep waiting. Last 15 lines:\n${(await capture(sock, info.id, 15)).join("\n")}`;
     }
     await sleep(250);
   }
@@ -952,7 +952,7 @@ const TOOLS = [
   {
     name: "wait_for",
     description:
-      "Poll a tmux pane until some line matches a JS regex, then return it with context. Checks the visible screen plus recent scrollback (~500 lines), so it returns immediately if the pattern is already present. TRAP: the command you typed is echoed in the pane, so a pattern that matches the command text itself (e.g. waiting for `done$` after typing `make && echo done`) fires immediately on the echo — anchor to the whole line (^done$) or wait for text that won't appear in the command. Use after starting a server/build to wait for a 'ready' or 'error' line. Errors on timeout, including the pane's last lines. If there is no known pattern to wait for, use wait_silence instead.",
+      "Poll a tmux pane until some line matches a JS regex, then return it with context. Checks the visible screen plus recent scrollback (~500 lines), so it returns immediately if the pattern is already present. TWO PATTERN TRAPS: (1) the command you typed is echoed in the pane, so a pattern matching the command text itself (e.g. `done$` after typing `make && echo done`) fires immediately on the echo; (2) TUI programs (e.g. a Claude Code session in the pane) DECORATE every rendered line (⏺ bullets, ⎿ indents), so a strict ^-anchor never matches their output. Best of both: `^[^A-Za-z0-9]*needle\\s*$` — tolerates leading decoration while still rejecting prose/echo lines that mention the needle mid-sentence. Use after starting a server/build to wait for a 'ready' or 'error' line. Timeout returns a normal TIMEOUT result (not an error) with the pane's last lines — reissue to keep waiting. If there is no known pattern to wait for, use wait_silence instead.",
     annotations: { title: "Wait for pattern in pane", readOnlyHint: true },
     inputSchema: {
       type: "object",
@@ -970,7 +970,7 @@ const TOOLS = [
   {
     name: "wait_silence",
     description:
-      "Wait until a pane STOPS producing output — no new lines and no in-place updates (progress bars/spinners) for `quiet_ms` (default 2000ms) — then return everything printed since the call started. Use when a build/command has no known completion string to wait_for. Caveat: a command that works silently for longer than quiet_ms before printing also counts as quiet — raise quiet_ms for such commands, or prefer wait_for when a completion string is known. Errors on timeout if the pane never goes quiet.",
+      "Wait until a pane STOPS producing output — no new lines and no in-place updates (progress bars/spinners) for `quiet_ms` (default 2000ms) — then return everything printed since the call started. Use when a build/command has no known completion string to wait_for. Caveat: a command that works silently for longer than quiet_ms before printing also counts as quiet — raise quiet_ms for such commands, or prefer wait_for when a completion string is known. Timeout returns a normal TIMEOUT result (not an error) — reissue to keep waiting.",
     annotations: { title: "Wait for pane to go quiet", readOnlyHint: true },
     inputSchema: {
       type: "object",
