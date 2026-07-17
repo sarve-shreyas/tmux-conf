@@ -42,7 +42,7 @@ import { access, mkdir, readdir, readFile, realpath, writeFile } from "node:fs/p
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const SERVER_INFO = { name: "tmux", version: "1.6.0" };
+const SERVER_INFO = { name: "tmux", version: "1.7.0" };
 const SUPPORTED_PROTOCOLS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
 const LATEST_PROTOCOL = "2025-06-18";
 const MAX_CHARS = 50_000;
@@ -622,16 +622,14 @@ async function runCommand({ target, command, timeout_ms, force = false, server, 
   let scratch = false;
   if (target === undefined || target === null || target === "") {
     scratch = true;
-    if (server) {
-      // explicit server named: keep the scratch window on that server
-      target = await scratchWindowOn(sock, null);
-      scratchNote = `, scratch window "${SCRATCH_WINDOW}"`;
-    } else {
-      const fl = await floatScratchPane();
-      sock = fl.sock;
-      target = fl.id;
-      scratchNote = `, scratch window "${SCRATCH_WINDOW}" in float session "${fl.session}" on server "${SCRATCH_SERVER}" (user: open with the scratch popup)`;
-    }
+    // Scratch ALWAYS lives on the float server — `server` only applies when a
+    // pane target is given. (Agents passing server:"default" with no target
+    // used to scatter scratch windows across the user's main servers.)
+    const fl = await floatScratchPane();
+    sock = fl.sock;
+    target = fl.id;
+    scratchNote = `, scratch window "${SCRATCH_WINDOW}" in float session "${fl.session}" on server "${SCRATCH_SERVER}" (user: open with the scratch popup)` +
+      (server ? ` — note: server:"${server}" is ignored when target is omitted` : "");
   } else {
     requireStr(target, "target");
   }
@@ -934,7 +932,7 @@ const TOOLS = [
   {
     name: "run_command",
     description:
-      "Run a shell command in a tmux pane and return its output and exit code (waits up to timeout_ms, default 30s). Multi-line commands, commands containing '!' (zsh history-expansion hazard), very long commands, and trailing-& backgrounding are handled automatically by sourcing a temp script instead of typing the text raw. OMIT `target` to run in a dedicated scratch window (\"claude-scratch\", created on demand and reused) — the easiest option when any shell will do; it lives on the user's floating-scratch tmux server, in the float session matching the user's current main session, so the user can watch it via their scratch popup. (With an explicit `server` and no target, the scratch window is created on that server instead.) Give a target pane only when the command must run in that pane's context. This types into the user's real terminal — visible to them, using their live environment (ssh agents, VPN, kubectl contexts, venvs). Useful when the sandboxed Bash tool can't run something. Half-typed input and stuck continuation prompts (dquote> etc.) are cleared with Ctrl-C/Ctrl-U first, and `; printf '<marker>' $?` is appended to detect completion. Refuses busy (non-shell) panes — override with force:true (e.g. a shell inside ssh). Every command is screened by the user's guard config (guard.json): deny patterns always block, and when its allow list is non-empty only matching commands run — a guard block is user policy, never something to rephrase around. On timeout the command keeps running; check with tail/wait_for/wait_silence.",
+      "Run a shell command in a tmux pane and return its output and exit code (waits up to timeout_ms, default 30s). Multi-line commands, commands containing '!' (zsh history-expansion hazard), very long commands, and trailing-& backgrounding are handled automatically by sourcing a temp script instead of typing the text raw. OMIT `target` to run in a dedicated scratch window (\"claude-scratch\", created on demand and reused) — the easiest option when any shell will do; it lives on the user's floating-scratch tmux server, in the float session matching the user's current main session, so the user can watch it via their scratch popup. The scratch ALWAYS goes to the float server — `server` applies only when `target` is given. Give a target pane only when the command must run in that pane's context. This types into the user's real terminal — visible to them, using their live environment (ssh agents, VPN, kubectl contexts, venvs). Useful when the sandboxed Bash tool can't run something. Half-typed input and stuck continuation prompts (dquote> etc.) are cleared with Ctrl-C/Ctrl-U first, and `; printf '<marker>' $?` is appended to detect completion. Refuses busy (non-shell) panes — override with force:true (e.g. a shell inside ssh). Every command is screened by the user's guard config (guard.json): deny patterns always block, and when its allow list is non-empty only matching commands run — a guard block is user policy, never something to rephrase around. On timeout the command keeps running; check with tail/wait_for/wait_silence.",
     annotations: { title: "Run command in pane" },
     inputSchema: {
       type: "object",
@@ -944,7 +942,7 @@ const TOOLS = [
         timeout_ms: { type: "integer", description: "How long to wait for completion (default 30000, max 600000)" },
         force: { type: "boolean", description: "Skip the idle-shell check, e.g. for a shell inside ssh (default false)" },
         save_output: { type: "boolean", description: "Also tee the command's full raw output to a temp file and return its contents byte-exact (no terminal line-wrapping). Use whenever the output will be parsed (JSON, long lines) — pane capture wraps long lines. On timeout the file keeps filling and can be read later. Default false." },
-        server: SERVER_PARAM,
+        server: { ...SERVER_PARAM, description: SERVER_PARAM.description + " Only applies together with `target` — without a target the scratch window ALWAYS goes to the float server; do not pass server just to be explicit." },
       },
       required: ["command"],
       additionalProperties: false,
