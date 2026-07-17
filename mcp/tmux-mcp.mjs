@@ -8,6 +8,7 @@
  * environment where you can watch (and interrupt) everything it does.
  *
  * Tools:
+ *   whoami        — where this Claude session lives (server/session/window/pane)
  *   list_servers  — discover all tmux servers (sockets) for this user
  *   list_panes    — map sessions/windows/panes; opt-in process/port info
  *   capture_pane  — read a pane's screen + scrollback, optional grep
@@ -37,11 +38,11 @@
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { access, mkdir, readdir, readFile, realpath } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const SERVER_INFO = { name: "tmux", version: "1.4.0" };
+const SERVER_INFO = { name: "tmux", version: "1.6.0" };
 const SUPPORTED_PROTOCOLS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
 const LATEST_PROTOCOL = "2025-06-18";
 const MAX_CHARS = 50_000;
@@ -403,6 +404,45 @@ async function listServers() {
   return JSON.stringify(servers, null, 1);
 }
 
+// Where this Claude session itself lives in tmux (from the TMUX/TMUX_PANE env
+// inherited at spawn), plus where its targetless scratch commands will go.
+async function whoAmI() {
+  if (!SELF_PANE || !SELF_SOCKET) {
+    return JSON.stringify({
+      inside_tmux: false,
+      note: "This Claude session was not started inside tmux (no TMUX/TMUX_PANE env). Targetless run_command falls back to the attached session's name for the float session.",
+      scratch_server: SCRATCH_SERVER,
+    }, null, 1);
+  }
+  const sock = ["-S", SELF_SOCKET];
+  const out = await tmux(
+    sock, "display-message", "-p", "-t", SELF_PANE,
+    "#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{pane_current_path}\t#{pane_width}\t#{pane_height}\t#{?session_attached,1,0}"
+  );
+  const [ses, wi, wn, pi, id, cwd, w, h, att] = out.trim().split("\t");
+  let serverName = SELF_SOCKET;
+  try {
+    const p = await realpath(SELF_SOCKET).catch(() => SELF_SOCKET);
+    const d = await realpath(tmpDir()).catch(() => tmpDir());
+    if (p.startsWith(d + "/")) serverName = p.slice(d.length + 1);
+  } catch {}
+  return JSON.stringify({
+    inside_tmux: true,
+    server: serverName,
+    socket: SELF_SOCKET,
+    session: ses,
+    window_index: +wi,
+    window_name: wn,
+    pane_id: id,
+    target: `${ses}:${wi}.${pi}`,
+    cwd,
+    size: `${w}x${h}`,
+    session_attached: att === "1",
+    scratch_goes_to: { server: SCRATCH_SERVER, float_session: ses, window: SCRATCH_WINDOW },
+    note: `pane ${id} is this Claude session's own pane (claude_session_pane) — never send keys to it`,
+  }, null, 1);
+}
+
 async function panesOf(sock, serverName, procInfo) {
   const fmt = [
     "#{session_name}", "#{window_index}", "#{window_name}", "#{pane_index}",
@@ -565,10 +605,16 @@ async function sendKeys({ target, text, keys, enter = false, snapshot_delay_ms, 
 
 async function runCommand({ target, command, timeout_ms, force = false, server, save_output = false }) {
   requireStr(command, "command");
-  if (/[\r\n]/.test(command)) throw new Error("command must be a single line — use send_keys for multi-line or interactive input");
-  const cmd = command.replace(/[;\s]+$/, "");
-  if (/&\s*$/.test(cmd)) throw new Error("background commands (trailing &) can't be awaited — use send_keys, then capture_pane/wait_for");
+  let cmd = command.replace(/\s+$/, "");
+  const background = /&$/.test(cmd) && !/&&$/.test(cmd);
+  if (!background) cmd = cmd.replace(/[;\s]+$/, "");
   await guardCommand(cmd);
+  // Interactive-typing hazards: '!' (zsh history expansion — e.g. the sequence
+  // !" is REMOVED from the line, unbalancing quotes into a dquote> continuation
+  // prompt), real newlines, trailing & (backgrounding), and very long lines.
+  // Such commands are written to a temp script and sourced, so the shell
+  // parses them non-interactively and verbatim.
+  const hazardous = /[!\r\n]/.test(cmd) || background || cmd.length > 200;
   const timeoutMs = clampInt(timeout_ms, 1000, 600000, 30000);
   let sock = sockFor(server);
 
@@ -599,6 +645,14 @@ async function runCommand({ target, command, timeout_ms, force = false, server, 
   }
   if (info.inMode) await tmux(sock, "send-keys", "-t", info.id, "-X", "cancel").catch(() => {});
 
+  if (SHELLS.has(info.cmd)) {
+    // C-c aborts pending multi-line input (dquote>/heredoc>/... continuation
+    // prompts) that C-u cannot clear — e.g. a previously mangled line left the
+    // shell waiting for a closing quote. Harmless at an empty prompt. Skipped
+    // under force on non-shell panes, where C-c could kill a program.
+    await tmux(sock, "send-keys", "-t", info.id, "C-c");
+    await sleep(80);
+  }
   await tmux(sock, "send-keys", "-t", info.id, "C-u"); // clear any half-typed input
   await sleep(60);
   info = await paneInfo(sock, info.id); // fresh cursor position after C-u
@@ -607,23 +661,29 @@ async function runCommand({ target, command, timeout_ms, force = false, server, 
 
   const marker = `__MCP_${randomBytes(4).toString("hex")}__`;
   const isFish = info.cmd === "fish";
+  const dir = join(tmpdir(), "tmux-mcp");
+  if (hazardous || save_output) await mkdir(dir, { recursive: true }).catch(() => {});
+  let srcFile = null;
+  if (hazardous) {
+    srcFile = join(dir, `cmd-${marker.slice(6, 14)}.sh`);
+    await writeFile(srcFile, cmd + "\n", "utf8");
+  }
+  const bodyCmd = srcFile ? `${isFish ? "source" : "."} ${srcFile}` : cmd;
   let outFile = null;
   let typed;
   if (save_output) {
-    const dir = join(tmpdir(), "tmux-mcp");
-    await mkdir(dir, { recursive: true }).catch(() => {});
     outFile = join(dir, `run-${marker.slice(6, 14)}.out`);
     // Pipe through tee: the pane still shows everything live, while the file
     // gets byte-exact output free of terminal line-wrapping. The exit code is
     // taken from the command, not tee, via the shell's pipestatus.
-    const grp = isFish ? `begin; ${cmd}; end` : `{ ${cmd}; }`;
+    const grp = isFish ? `begin; ${bodyCmd}; end` : `{ ${bodyCmd}; }`;
     const st = isFish ? "$pipestatus[1]"
       : info.cmd === "bash" ? "${PIPESTATUS[0]}"
       : info.cmd === "zsh" ? "${pipestatus[1]}"
       : "$?"; // plain sh has no pipestatus — reports tee's status
     typed = `${grp} 2>&1 | tee ${outFile}; printf '${marker}%s\\n' ${st}`;
   } else {
-    typed = `${cmd}; printf '${marker}%s\\n' ${isFish ? "$status" : "$?"}`;
+    typed = `${bodyCmd}; printf '${marker}%s\\n' ${isFish ? "$status" : "$?"}`;
   }
   await tmux(sock, "send-keys", "-t", info.id, "-l", "--", typed);
   await tmux(sock, "send-keys", "-t", info.id, "Enter");
@@ -679,9 +739,14 @@ async function runCommand({ target, command, timeout_ms, force = false, server, 
           partial = (await readFile(outFile, "utf8")).trim() || partial;
         } catch {}
       }
+      let stuckNote = "";
+      const lastLine = (ls[ls.length - 1] ?? "").trim();
+      if (/(quote|heredoc|cmdsubst|pipe|cmdand|cmdor|braceparam|then|do|function)\s*>$/.test(lastLine)) {
+        stuckNote = ` NOTE: the pane shows a shell continuation prompt ("${lastLine}") — the command never ran; the shell is waiting for more input (likely a mangled/unbalanced line). Send send_keys keys:["C-c"] to abort it, then retry.`;
+      }
       return (
         `TIMEOUT: still running after ${timeoutMs}ms (pane ${info.id}${where}). The command was left running — it may need more time or user input.` +
-        `${extra} Check again with tail/wait_for/wait_silence, or abort it with send_keys keys:["C-c"].\n--- output so far ---\n` +
+        `${stuckNote}${extra} Check again with tail/wait_for/wait_silence, or abort it with send_keys keys:["C-c"].\n--- output so far ---\n` +
         tailChars(partial || "(no output yet)")
       );
     }
@@ -767,6 +832,14 @@ const TOOLS = [
     annotations: { title: "List tmux servers", readOnlyHint: true },
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     handler: listServers,
+  },
+  {
+    name: "whoami",
+    description:
+      "Where THIS Claude session lives in tmux: its server (socket), session, window, pane id, cwd, and whether the session is attached — plus where targetless run_command scratch output will go (scratch server + float session). Call it to orient yourself before targeting panes: the returned pane_id is your own pane and must never receive keys. Reports inside_tmux:false if Claude Code was not launched inside tmux.",
+    annotations: { title: "Where am I in tmux", readOnlyHint: true },
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: whoAmI,
   },
   {
     name: "list_panes",
@@ -861,13 +934,13 @@ const TOOLS = [
   {
     name: "run_command",
     description:
-      "Run a single-line foreground shell command in a tmux pane and return its output and exit code (waits up to timeout_ms, default 30s). OMIT `target` to run in a dedicated scratch window (\"claude-scratch\", created on demand and reused) — the easiest option when any shell will do; it lives on the user's floating-scratch tmux server, in the float session matching the user's current main session, so the user can watch it via their scratch popup. (With an explicit `server` and no target, the scratch window is created on that server instead.) Give a target pane only when the command must run in that pane's context. This types into the user's real terminal — visible to them, using their live environment (ssh agents, VPN, kubectl contexts, venvs). Useful when the sandboxed Bash tool can't run something. Half-typed input is cleared with Ctrl-U first, and `; printf '<marker>' $?` is appended to detect completion. Refuses busy (non-shell) panes — override with force:true (e.g. a shell inside ssh). Every command is screened by the user's guard config (guard.json): deny patterns always block, and when its allow list is non-empty only matching commands run — a guard block is user policy, never something to rephrase around. On timeout the command keeps running; check with tail/wait_for/wait_silence.",
+      "Run a shell command in a tmux pane and return its output and exit code (waits up to timeout_ms, default 30s). Multi-line commands, commands containing '!' (zsh history-expansion hazard), very long commands, and trailing-& backgrounding are handled automatically by sourcing a temp script instead of typing the text raw. OMIT `target` to run in a dedicated scratch window (\"claude-scratch\", created on demand and reused) — the easiest option when any shell will do; it lives on the user's floating-scratch tmux server, in the float session matching the user's current main session, so the user can watch it via their scratch popup. (With an explicit `server` and no target, the scratch window is created on that server instead.) Give a target pane only when the command must run in that pane's context. This types into the user's real terminal — visible to them, using their live environment (ssh agents, VPN, kubectl contexts, venvs). Useful when the sandboxed Bash tool can't run something. Half-typed input and stuck continuation prompts (dquote> etc.) are cleared with Ctrl-C/Ctrl-U first, and `; printf '<marker>' $?` is appended to detect completion. Refuses busy (non-shell) panes — override with force:true (e.g. a shell inside ssh). Every command is screened by the user's guard config (guard.json): deny patterns always block, and when its allow list is non-empty only matching commands run — a guard block is user policy, never something to rephrase around. On timeout the command keeps running; check with tail/wait_for/wait_silence.",
     annotations: { title: "Run command in pane" },
     inputSchema: {
       type: "object",
       properties: {
         target: { type: "string", description: "Pane target — pane id like %3 or session:window.pane. Omit to use the reusable scratch window (recommended when any shell will do)" },
-        command: { type: "string", description: "Single-line foreground shell command" },
+        command: { type: "string", description: "Shell command. Multi-line is fine; a trailing & backgrounds it (returns launch status immediately — follow with tail/wait_for)" },
         timeout_ms: { type: "integer", description: "How long to wait for completion (default 30000, max 600000)" },
         force: { type: "boolean", description: "Skip the idle-shell check, e.g. for a shell inside ssh (default false)" },
         save_output: { type: "boolean", description: "Also tee the command's full raw output to a temp file and return its contents byte-exact (no terminal line-wrapping). Use whenever the output will be parsed (JSON, long lines) — pane capture wraps long lines. On timeout the file keeps filling and can be read later. Default false." },
