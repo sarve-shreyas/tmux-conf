@@ -42,7 +42,7 @@ import { access, mkdir, readdir, readFile, realpath, writeFile } from "node:fs/p
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const SERVER_INFO = { name: "tmux", version: "1.7.1" };
+const SERVER_INFO = { name: "tmux", version: "1.7.2" };
 const SUPPORTED_PROTOCOLS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
 const LATEST_PROTOCOL = "2025-06-18";
 const MAX_CHARS = 50_000;
@@ -325,6 +325,31 @@ async function selfCwd() {
   return null;
 }
 
+// Environment for STARTING a tmux server. A tmux server keeps — and hands to
+// every future pane shell — the environment of whoever started it. MCP hosts
+// vary wildly (background jobs, IDE-launched Claude sessions) and can carry
+// stripped or exotic env (missing SHELL, foreign ZDOTDIR, minimal PATH),
+// which yields scratch shells that never load the user's zsh config (bare
+// "host%" prompts, missing aliases/PATH). Start servers from a minimal sane
+// baseline instead; pane shells are login shells, so the user's own
+// .zprofile/.zshrc rebuilds the full environment on top.
+function serverStartEnv() {
+  const e = process.env;
+  const env = {
+    HOME: e.HOME,
+    USER: e.USER,
+    LOGNAME: e.LOGNAME || e.USER,
+    SHELL: e.SHELL || "/bin/zsh",
+    PATH: "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    TERM: "xterm-256color",
+    LANG: e.LANG || "en_US.UTF-8",
+    TMPDIR: e.TMPDIR,
+    TMUX_TMPDIR: e.TMUX_TMPDIR, // keep socket discovery consistent
+  };
+  for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+  return env;
+}
+
 // Scratch pane on the user's floating-scratch server: ensure the float
 // session for the current main session exists (window 0 stays a plain shell,
 // like the popup script creates), then reuse/create the claude-scratch
@@ -343,7 +368,10 @@ async function floatScratchPane() {
     } catch {}
     const args = [...pre, "new-session", "-d", "-s", name];
     if (cwd) args.push("-c", cwd);
-    await tmux(sock, ...args);
+    // May auto-start the floats server — do it with a clean baseline env.
+    await run("tmux", [...sock, ...args], { env: serverStartEnv() }).catch((e) => {
+      throw new Error(e.message.replace(/^tmux:/, "tmux new-session:"));
+    });
   }
   const id = await scratchWindowOn(sock, name, cwd);
   return { sock, id, session: name };
